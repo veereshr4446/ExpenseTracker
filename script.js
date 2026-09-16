@@ -714,6 +714,111 @@
     showToast("CSV exported");
   }
 
+  function truncate(str, n) {
+    str = String(str || "");
+    return str.length > n ? str.slice(0, n - 1) + "\u2026" : str;
+  }
+
+  function pdfMoney(n) {
+    const v = Number(n) || 0;
+    const symbol = currency() === "\u20B9" ? "Rs. " : currency();
+    return symbol + v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+
+  function exportPDF() {
+    if (!window.jspdf) {
+      showToast("PDF library failed to load", true);
+      return;
+    }
+    const { jsPDF } = window.jspdf;
+    const doc = new jsPDF({ unit: "pt", format: "a4" });
+    const marginX = 40;
+    const pageWidth = doc.internal.pageSize.getWidth();
+    const pageHeight = doc.internal.pageSize.getHeight();
+    let y = 50;
+
+    doc.setFont("helvetica", "bold");
+    doc.setFontSize(18);
+    doc.text("Ledger", marginX, y);
+    doc.setFont("helvetica", "normal");
+    doc.setFontSize(11);
+    doc.setTextColor(120, 117, 104);
+    doc.text(monthLabel(currentMonth.year, currentMonth.month), marginX, y + 18);
+    doc.setTextColor(32, 36, 31);
+
+    const monthTx = getMonthTransactions();
+    let income = 0, expense = 0;
+    monthTx.forEach((t) => {
+      if (t.type === "income") income += Number(t.amount) || 0;
+      else expense += Number(t.amount) || 0;
+    });
+    const net = income - expense;
+
+    y += 46;
+    doc.setFontSize(11);
+    doc.setFont("helvetica", "bold");
+    doc.text("Balance", marginX, y);
+    doc.text("Income", marginX + 180, y);
+    doc.text("Expenses", marginX + 340, y);
+    doc.setFont("helvetica", "normal");
+    doc.text(pdfMoney(net), marginX, y + 16);
+    doc.text(pdfMoney(income), marginX + 180, y + 16);
+    doc.text(pdfMoney(expense), marginX + 340, y + 16);
+
+    y += 40;
+    doc.setDrawColor(217, 212, 194);
+    doc.line(marginX, y, pageWidth - marginX, y);
+    y += 22;
+
+    const cols = [
+      { label: "Date", x: marginX },
+      { label: "Type", x: marginX + 70 },
+      { label: "Category", x: marginX + 125 },
+      { label: "Description", x: marginX + 215 },
+      { label: "Amount", x: marginX + 400 },
+    ];
+
+    function drawTableHeader() {
+      doc.setFont("helvetica", "bold");
+      doc.setFontSize(10);
+      cols.forEach((c) => doc.text(c.label, c.x, y));
+      y += 8;
+      doc.setDrawColor(217, 212, 194);
+      doc.line(marginX, y, pageWidth - marginX, y);
+      y += 16;
+      doc.setFont("helvetica", "normal");
+    }
+
+    drawTableHeader();
+
+    const list = getFilteredTransactions();
+    if (list.length === 0) {
+      doc.setTextColor(120, 117, 104);
+      doc.text("No transactions for this view.", marginX, y);
+      doc.setTextColor(32, 36, 31);
+    } else {
+      list.forEach((t) => {
+        if (y > pageHeight - 60) {
+          doc.addPage();
+          y = 50;
+          drawTableHeader();
+        }
+        const cat = categoryById(t.category);
+        const catName = cat ? cat.name : "Other";
+        const sign = t.type === "income" ? "+" : "-";
+        doc.text(t.date, cols[0].x, y);
+        doc.text(t.type, cols[1].x, y);
+        doc.text(truncate(catName, 15), cols[2].x, y);
+        doc.text(truncate(t.description || "-", 26), cols[3].x, y);
+        doc.text(sign + pdfMoney(t.amount), cols[4].x, y);
+        y += 18;
+      });
+    }
+
+    doc.save("ledger-" + currentMonth.year + "-" + String(currentMonth.month + 1).padStart(2, "0") + ".pdf");
+    showToast("PDF exported");
+  }
+
   /* ================= Month navigation ================= */
   function changeMonth(delta) {
     const d = new Date(currentMonth.year, currentMonth.month + delta, 1);
@@ -728,6 +833,7 @@
 
     $("add-transaction-btn").addEventListener("click", () => openTransactionModal(null));
     $("export-btn").addEventListener("click", exportCSV);
+    $("export-pdf-btn").addEventListener("click", exportPDF);
     $("settings-btn").addEventListener("click", () => { renderCurrencyOptions(); openModal("settings-modal"); });
     $("apply-recurring-btn").addEventListener("click", applyRecurring);
 
