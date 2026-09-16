@@ -1,8 +1,8 @@
 :root {
   --ink: #20241F;
-  --paper: #F1EFE5;
-  --card: #FBFAF4;
-  --border: #D9D4C2;
+  --paper: #E9F1E7;
+  --card: #F6FAF4;
+  --border: #CFDECB;
   --muted: #7A7568;
   --income: #2F6F4E;
   --income-bg: #EAF3EE;
@@ -323,7 +323,7 @@ input, select {
   padding: 8px 16px;
   font-size: 12px;
   color: var(--muted);
-  background: #F5F3EA;
+  background: #EEF5EC;
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
 }
