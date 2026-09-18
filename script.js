@@ -27,6 +27,8 @@
 
   const CURRENCIES = ["₹", "$", "€", "£", "¥"];
   const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+  const ACCENT_PRESETS = ["#3B5BA5", "#2F6F4E", "#B5482E", "#6B4FA0", "#2D6E6E", "#A9862F"];
+  const FREQUENCY_LABEL = { weekly: "week", monthly: "month", yearly: "year" };
 
   const INCOME_HEX = "#2F6F4E";
   const EXPENSE_HEX = "#B5482E";
@@ -46,8 +48,15 @@
     transactions: [],
     categories: DEFAULT_CATEGORIES.slice(),
     budgets: {},
-    settings: { currency: "₹" },
+    settings: { currency: "₹", theme: "light", accent: "#3B5BA5" },
+    people: [],
+    personEntries: [],
   };
+
+  let summaryScope = "alltime"; // "alltime" | "month"
+
+  let editingPersonId = null;
+  let currentEntryType = "gave";
 
   const now = new Date();
   let currentMonth = { year: now.getFullYear(), month: now.getMonth() };
@@ -63,6 +72,7 @@
   let categoryChartInstance = null;
   let trendChartInstance = null;
   let toastTimer = null;
+  let currentAttachmentData = null;
 
   /* ================= Helpers ================= */
   function uid() {
@@ -107,6 +117,27 @@
     return document.getElementById(id);
   }
 
+  function cssVar(name) {
+    return getComputedStyle(document.body).getPropertyValue(name).trim();
+  }
+
+  function hexToRgba(hex, alpha) {
+    let h = hex.replace("#", "");
+    if (h.length === 3) h = h.split("").map((c) => c + c).join("");
+    const bigint = parseInt(h, 16);
+    const r = (bigint >> 16) & 255, g = (bigint >> 8) & 255, b = bigint & 255;
+    return "rgba(" + r + "," + g + "," + b + "," + alpha + ")";
+  }
+
+  function applyTheme(theme) {
+    document.body.classList.toggle("theme-dark", theme === "dark");
+  }
+
+  function applyAccent(hex) {
+    document.documentElement.style.setProperty("--accent", hex);
+    document.documentElement.style.setProperty("--accent-transparent", hexToRgba(hex, 0.2));
+  }
+
   /* ================= Persistence ================= */
   function loadData() {
     try {
@@ -117,7 +148,9 @@
           transactions: parsed.transactions || [],
           categories: parsed.categories && parsed.categories.length ? parsed.categories : DEFAULT_CATEGORIES.slice(),
           budgets: parsed.budgets || {},
-          settings: parsed.settings || { currency: "₹" },
+          settings: Object.assign({ currency: "₹", theme: "light", accent: "#3B5BA5" }, parsed.settings || {}),
+          people: parsed.people || [],
+          personEntries: parsed.personEntries || [],
         };
       }
     } catch (e) {
@@ -161,7 +194,8 @@
         const q = filters.search.trim().toLowerCase();
         const cat = categoryById(t.category);
         const catName = cat ? cat.name.toLowerCase() : "";
-        if (!t.description.toLowerCase().includes(q) && !catName.includes(q)) return false;
+        const tagsText = (t.tags || []).join(" ").toLowerCase();
+        if (!t.description.toLowerCase().includes(q) && !catName.includes(q) && !tagsText.includes(q)) return false;
       }
       return true;
     });
@@ -175,15 +209,52 @@
     return list;
   }
 
+  function getOccurrencesInMonth(orig, year, month) {
+    const freq = orig.frequency || "monthly";
+    const origDate = new Date(orig.date + "T00:00:00");
+    const monthStart = new Date(year, month, 1);
+    const monthEnd = new Date(year, month + 1, 0);
+    const dates = [];
+
+    if (freq === "monthly") {
+      // skip the transaction's own month
+      if (year === origDate.getFullYear() && month === origDate.getMonth()) return [];
+      if (monthStart < new Date(origDate.getFullYear(), origDate.getMonth(), 1)) return [];
+      const day = Math.min(origDate.getDate(), daysInMonth(year, month));
+      dates.push(year + "-" + String(month + 1).padStart(2, "0") + "-" + String(day).padStart(2, "0"));
+    } else if (freq === "yearly") {
+      if (month !== origDate.getMonth()) return [];
+      if (year === origDate.getFullYear()) return [];
+      if (year < origDate.getFullYear()) return [];
+      const day = Math.min(origDate.getDate(), daysInMonth(year, month));
+      dates.push(year + "-" + String(month + 1).padStart(2, "0") + "-" + String(day).padStart(2, "0"));
+    } else if (freq === "weekly") {
+      let cursor = new Date(origDate);
+      cursor.setDate(cursor.getDate() + 7);
+      let guard = 0;
+      while (cursor <= monthEnd && guard < 1000) {
+        guard++;
+        if (cursor >= monthStart && cursor <= monthEnd) {
+          const y = cursor.getFullYear(), m = cursor.getMonth(), d = cursor.getDate();
+          dates.push(y + "-" + String(m + 1).padStart(2, "0") + "-" + String(d).padStart(2, "0"));
+        }
+        cursor.setDate(cursor.getDate() + 7);
+      }
+    }
+    return dates;
+  }
+
   function getPendingRecurring() {
     const originals = data.transactions.filter((t) => t.recurring);
-    return originals.filter((orig) => {
-      return !data.transactions.some((t) => {
-        if (t.recurringId !== orig.id) return false;
-        const d = new Date(t.date + "T00:00:00");
-        return d.getFullYear() === currentMonth.year && d.getMonth() === currentMonth.month;
+    const pending = [];
+    originals.forEach((orig) => {
+      const occurrences = getOccurrencesInMonth(orig, currentMonth.year, currentMonth.month);
+      occurrences.forEach((date) => {
+        const exists = data.transactions.some((t) => t.recurringId === orig.id && t.date === date);
+        if (!exists) pending.push({ orig, date });
       });
     });
+    return pending;
   }
 
   /* ================= Render: header / summary ================= */
@@ -192,9 +263,9 @@
   }
 
   function renderSummary() {
-    const monthTx = getMonthTransactions();
+    const txSet = summaryScope === "alltime" ? data.transactions : getMonthTransactions();
     let income = 0, expense = 0;
-    monthTx.forEach((t) => {
+    txSet.forEach((t) => {
       if (t.type === "income") income += Number(t.amount) || 0;
       else expense += Number(t.amount) || 0;
     });
@@ -205,6 +276,13 @@
     balanceEl.classList.add(net >= 0 ? "income-color" : "expense-color");
     $("income-value").textContent = fmtMoney(income);
     $("expense-value").textContent = fmtMoney(expense);
+  }
+
+  function setSummaryScope(scope) {
+    summaryScope = scope;
+    $("scope-alltime-btn").classList.toggle("active", scope === "alltime");
+    $("scope-month-btn").classList.toggle("active", scope === "month");
+    renderSummary();
   }
 
   function renderRecurringBanner() {
@@ -248,13 +326,22 @@
         const catColor = cat ? cat.color : MUTED_HEX;
         const sign = t.type === "income" ? "+" : "\u2212";
         const amountColor = t.type === "income" ? "income-color" : "expense-color";
+        const repeatTitle = t.recurring ? "Repeats " + (FREQUENCY_LABEL[t.frequency] || "month") + "ly" : "";
+        const tagsHtml = t.tags && t.tags.length
+          ? `<div class="tag-row">${t.tags.map((tag) => `<span class="tag-chip">${escapeHtml(tag)}</span>`).join("")}</div>`
+          : "";
+        const attachmentHtml = t.attachment
+          ? `<img class="tx-attachment-thumb" src="${t.attachment}" data-action="view-attachment" alt="Receipt" />`
+          : "";
         html += `
           <div class="tx-row" data-id="${t.id}">
             <div class="tx-dot" style="background:${catColor}"></div>
             <div class="tx-info">
-              <div class="tx-desc">${escapeHtml(t.description || "(No description)")}${t.recurring ? ICON.repeat : ""}</div>
+              <div class="tx-desc">${escapeHtml(t.description || "(No description)")}${t.recurring ? `<span title="${repeatTitle}">${ICON.repeat}</span>` : ""}</div>
               <div class="tx-category">${escapeHtml(catName)}</div>
+              ${tagsHtml}
             </div>
+            ${attachmentHtml}
             <div class="tx-amount ${amountColor}">${sign}${fmtMoney(t.amount)}</div>
             <div class="tx-actions">
               <button class="icon-btn-sm" data-action="edit-tx" data-id="${t.id}" aria-label="Edit">${ICON.pencil}</button>
@@ -318,7 +405,7 @@
         datasets: [{
           data: breakdown.map((b) => b.value),
           backgroundColor: breakdown.map((b) => b.color),
-          borderColor: CARD_HEX,
+          borderColor: cssVar("--card"),
           borderWidth: 2,
         }],
       },
@@ -370,8 +457,8 @@
           {
             label: "Income",
             data: points.map((p) => p.income),
-            borderColor: INCOME_HEX,
-            backgroundColor: INCOME_HEX,
+            borderColor: cssVar("--income"),
+            backgroundColor: cssVar("--income"),
             borderWidth: 2,
             pointRadius: 3,
             tension: 0.3,
@@ -379,8 +466,8 @@
           {
             label: "Expense",
             data: points.map((p) => p.expense),
-            borderColor: EXPENSE_HEX,
-            backgroundColor: EXPENSE_HEX,
+            borderColor: cssVar("--expense"),
+            backgroundColor: cssVar("--expense"),
             borderWidth: 2,
             pointRadius: 3,
             tension: 0.3,
@@ -395,8 +482,8 @@
           tooltip: { callbacks: { label: (ctx) => " " + ctx.dataset.label + ": " + fmtMoney(ctx.parsed.y) } },
         },
         scales: {
-          x: { grid: { display: false }, ticks: { color: MUTED_HEX, font: { size: 11 } } },
-          y: { grid: { color: BORDER_HEX }, ticks: { color: MUTED_HEX, font: { size: 10 } } },
+          x: { grid: { display: false }, ticks: { color: cssVar("--muted"), font: { size: 11 } } },
+          y: { grid: { color: cssVar("--border") }, ticks: { color: cssVar("--muted"), font: { size: 10 } } },
         },
       },
     });
@@ -468,10 +555,48 @@
     $(id).classList.add("hidden");
   }
   function closeAllModals() {
-    ["transaction-modal", "category-modal", "budget-modal", "settings-modal"].forEach(closeModal);
+    ["transaction-modal", "category-modal", "budget-modal", "settings-modal", "people-modal", "attachment-lightbox"].forEach(closeModal);
   }
 
   /* ================= Transaction modal ================= */
+  function parseTags(str) {
+    return str.split(",").map((t) => t.trim()).filter(Boolean);
+  }
+
+  function compressImage(file, callback) {
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const img = new Image();
+      img.onload = () => {
+        const maxW = 800;
+        const scale = Math.min(1, maxW / img.width);
+        const canvas = document.createElement("canvas");
+        canvas.width = img.width * scale;
+        canvas.height = img.height * scale;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        callback(canvas.toDataURL("image/jpeg", 0.7));
+      };
+      img.src = ev.target.result;
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function setAttachmentPreview(dataUrl) {
+    currentAttachmentData = dataUrl;
+    const wrap = $("attachment-preview-wrap");
+    if (dataUrl) {
+      $("attachment-preview").src = dataUrl;
+      wrap.classList.remove("hidden");
+    } else {
+      wrap.classList.add("hidden");
+    }
+  }
+
+  function setRecurringFieldVisibility(checked) {
+    $("recurring-frequency-select").classList.toggle("hidden", !checked);
+  }
+
   function renderCategorySelectOptions(type, preferredId) {
     const select = $("category-select");
     const available = data.categories.filter((c) => c.type === type || c.type === "both");
@@ -496,8 +621,13 @@
     $("transaction-id").value = tx ? tx.id : "";
     $("amount-input").value = tx ? tx.amount : "";
     $("description-input").value = tx ? tx.description : "";
+    $("tags-input").value = tx && tx.tags ? tx.tags.join(", ") : "";
     $("date-input").value = tx ? tx.date : todayStr();
     $("recurring-checkbox").checked = tx ? !!tx.recurring : false;
+    $("recurring-frequency-select").value = tx && tx.frequency ? tx.frequency : "monthly";
+    setRecurringFieldVisibility(tx ? !!tx.recurring : false);
+    $("attachment-input").value = "";
+    setAttachmentPreview(tx ? tx.attachment || null : null);
     $("transaction-error").classList.add("hidden");
 
     const type = tx ? tx.type : "expense";
@@ -514,9 +644,12 @@
   function saveTransactionFromForm() {
     const amount = Number($("amount-input").value);
     const description = $("description-input").value.trim();
+    const tags = parseTags($("tags-input").value);
     const category = $("category-select").value;
     const date = $("date-input").value;
     const recurring = $("recurring-checkbox").checked;
+    const frequency = $("recurring-frequency-select").value;
+    const attachment = currentAttachmentData;
     const errorEl = $("transaction-error");
 
     if (!amount || isNaN(amount) || amount <= 0) {
@@ -540,13 +673,19 @@
       const updated = {
         id: editingTransactionId,
         type: currentTxType,
-        amount, description, category, date, recurring,
+        amount, description, tags, category, date, recurring,
+        frequency: recurring ? frequency : undefined,
+        attachment: attachment || undefined,
         recurringId: existing ? existing.recurringId : undefined,
       };
       data.transactions = data.transactions.map((t) => (t.id === editingTransactionId ? updated : t));
       showToast("Transaction updated");
     } else {
-      data.transactions.push({ id: uid(), type: currentTxType, amount, description, category, date, recurring });
+      data.transactions.push({
+        id: uid(), type: currentTxType, amount, description, tags, category, date, recurring,
+        frequency: recurring ? frequency : undefined,
+        attachment: attachment || undefined,
+      });
       showToast(currentTxType === "income" ? "Income added" : "Expense added");
     }
 
@@ -562,13 +701,9 @@
 
   function applyRecurring() {
     const pending = getPendingRecurring();
-    const dim = daysInMonth(currentMonth.year, currentMonth.month);
-    const copies = pending.map((orig) => {
-      const origDay = new Date(orig.date + "T00:00:00").getDate();
-      const day = Math.min(origDay, dim);
-      const date = currentMonth.year + "-" + String(currentMonth.month + 1).padStart(2, "0") + "-" + String(day).padStart(2, "0");
-      return { ...orig, id: uid(), date, recurring: false, recurringId: orig.id };
-    });
+    const copies = pending.map(({ orig, date }) => ({
+      ...orig, id: uid(), date, recurring: false, recurringId: orig.id,
+    }));
     data.transactions = data.transactions.concat(copies);
     showToast("Added " + copies.length + " recurring transaction" + (copies.length === 1 ? "" : "s"));
     persist();
@@ -680,6 +815,217 @@
     persist();
   }
 
+  /* ================= People ================= */
+  function personEntriesFor(personId) {
+    return data.personEntries.filter((e) => e.personId === personId);
+  }
+
+  function personBalance(personId) {
+    let gave = 0, received = 0;
+    personEntriesFor(personId).forEach((e) => {
+      if (e.type === "gave") gave += Number(e.amount) || 0;
+      else received += Number(e.amount) || 0;
+    });
+    return gave - received; // positive: they owe you. negative: you owe them.
+  }
+
+  function initials(name) {
+    return name.trim().split(/\s+/).slice(0, 2).map((w) => w[0].toUpperCase()).join("");
+  }
+
+  function renderPeopleList() {
+    const listEl = $("people-list");
+    const emptyEl = $("people-empty");
+    if (data.people.length === 0) {
+      listEl.innerHTML = "";
+      emptyEl.classList.remove("hidden");
+      return;
+    }
+    emptyEl.classList.add("hidden");
+    listEl.innerHTML = data.people.map((p) => {
+      const bal = personBalance(p.id);
+      const colorClass = bal > 0 ? "income-color" : bal < 0 ? "expense-color" : "";
+      const sub = bal > 0 ? "owes you" : bal < 0 ? "you owe" : "settled up";
+      return `
+        <button type="button" class="person-row" data-id="${p.id}">
+          <span class="person-avatar">${escapeHtml(initials(p.name || "?"))}</span>
+          <span class="person-row-info">
+            <span class="person-row-name">${escapeHtml(p.name)}</span>
+            ${p.note ? `<span class="person-row-note">${escapeHtml(p.note)}</span>` : ""}
+          </span>
+          <span>
+            <span class="person-row-balance ${colorClass}">${bal === 0 ? fmtMoney(0) : fmtMoney(Math.abs(bal))}</span>
+            <div class="person-row-balance-sub">${sub}</div>
+          </span>
+        </button>`;
+    }).join("");
+  }
+
+  function showPeopleListView() {
+    $("people-list-view").classList.remove("hidden");
+    $("person-form-view").classList.add("hidden");
+    $("person-detail-view").classList.add("hidden");
+    $("people-modal-title").textContent = "People";
+    renderPeopleList();
+  }
+
+  function showPersonFormView() {
+    $("person-name-input").value = "";
+    $("person-note-input").value = "";
+    $("person-error").classList.add("hidden");
+    $("people-list-view").classList.add("hidden");
+    $("person-form-view").classList.remove("hidden");
+    $("person-detail-view").classList.add("hidden");
+    $("people-modal-title").textContent = "New person";
+    $("person-name-input").focus();
+  }
+
+  function savePersonFromForm() {
+    const name = $("person-name-input").value.trim();
+    const note = $("person-note-input").value.trim();
+    const errorEl = $("person-error");
+    if (!name) {
+      errorEl.textContent = "Enter a name.";
+      errorEl.classList.remove("hidden");
+      return;
+    }
+    const person = { id: uid(), name, note };
+    data.people.push(person);
+    persist();
+    openPersonDetail(person.id);
+  }
+
+  function setEntryType(type) {
+    currentEntryType = type;
+    $("entry-gave-btn").classList.toggle("active", type === "gave");
+    $("entry-received-btn").classList.toggle("active", type === "received");
+  }
+
+  function renderPersonEntries(personId) {
+    const entries = personEntriesFor(personId).slice().sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id));
+    const listEl = $("person-entries-list");
+    const emptyEl = $("person-entries-empty");
+    if (entries.length === 0) {
+      listEl.innerHTML = "";
+      emptyEl.classList.remove("hidden");
+      return;
+    }
+    emptyEl.classList.add("hidden");
+    listEl.innerHTML = entries.map((e) => {
+      const sign = e.type === "gave" ? "\u2212" : "+";
+      const colorClass = e.type === "gave" ? "expense-color" : "income-color";
+      const dateLabel = new Date(e.date + "T00:00:00").toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+      return `
+        <div class="entry-row" data-id="${e.id}">
+          <div class="entry-row-info">
+            <div class="entry-row-desc">${escapeHtml(e.description || (e.type === "gave" ? "Gave money" : "Received money"))}</div>
+            <div class="entry-row-date">${escapeHtml(dateLabel)}</div>
+          </div>
+          <div class="entry-row-amount ${colorClass}">${sign}${fmtMoney(e.amount)}</div>
+          <div class="entry-row-actions">
+            <button class="icon-btn-sm" data-action="delete-entry" data-id="${e.id}" aria-label="Delete entry">${ICON.trash}</button>
+          </div>
+        </div>`;
+    }).join("");
+  }
+
+  function renderPersonBalanceBanner(personId) {
+    const bal = personBalance(personId);
+    const person = data.people.find((p) => p.id === personId);
+    const name = person ? person.name : "";
+    const banner = $("person-balance-banner");
+    if (bal > 0) {
+      banner.innerHTML = `<strong>${escapeHtml(name)}</strong> owes you <span class="income-color">${fmtMoney(bal)}</span>`;
+    } else if (bal < 0) {
+      banner.innerHTML = `You owe <strong>${escapeHtml(name)}</strong> <span class="expense-color">${fmtMoney(Math.abs(bal))}</span>`;
+    } else {
+      banner.innerHTML = `You and <strong>${escapeHtml(name)}</strong> are settled up`;
+    }
+  }
+
+  function openPersonDetail(personId) {
+    const person = data.people.find((p) => p.id === personId);
+    if (!person) return;
+    editingPersonId = personId;
+    $("detail-person-id").value = personId;
+    $("detail-person-name").textContent = person.name;
+    $("person-name-display-wrap").classList.remove("hidden");
+    $("person-name-edit-wrap").classList.add("hidden");
+
+    $("entry-amount-input").value = "";
+    $("entry-description-input").value = "";
+    $("entry-date-input").value = todayStr();
+    $("entry-error").classList.add("hidden");
+    setEntryType("gave");
+
+    renderPersonBalanceBanner(personId);
+    renderPersonEntries(personId);
+
+    $("people-list-view").classList.add("hidden");
+    $("person-form-view").classList.add("hidden");
+    $("person-detail-view").classList.remove("hidden");
+    $("people-modal-title").textContent = "Person";
+  }
+
+  function startRenamePerson() {
+    const person = data.people.find((p) => p.id === editingPersonId);
+    if (!person) return;
+    $("person-name-edit-input").value = person.name;
+    $("person-name-display-wrap").classList.add("hidden");
+    $("person-name-edit-wrap").classList.remove("hidden");
+    $("person-name-edit-input").focus();
+  }
+
+  function saveRenamePerson() {
+    const newName = $("person-name-edit-input").value.trim();
+    if (!newName) return;
+    data.people = data.people.map((p) => (p.id === editingPersonId ? { ...p, name: newName } : p));
+    $("detail-person-name").textContent = newName;
+    $("person-name-display-wrap").classList.remove("hidden");
+    $("person-name-edit-wrap").classList.add("hidden");
+    persist();
+    renderPersonBalanceBanner(editingPersonId);
+  }
+
+  function deleteCurrentPerson() {
+    data.people = data.people.filter((p) => p.id !== editingPersonId);
+    data.personEntries = data.personEntries.filter((e) => e.personId !== editingPersonId);
+    showToast("Person deleted");
+    persist();
+    showPeopleListView();
+  }
+
+  function addEntryFromForm() {
+    const amount = Number($("entry-amount-input").value);
+    const description = $("entry-description-input").value.trim();
+    const date = $("entry-date-input").value;
+    const errorEl = $("entry-error");
+    if (!amount || isNaN(amount) || amount <= 0) {
+      errorEl.textContent = "Enter an amount greater than zero.";
+      errorEl.classList.remove("hidden");
+      return;
+    }
+    if (!date) {
+      errorEl.textContent = "Choose a date.";
+      errorEl.classList.remove("hidden");
+      return;
+    }
+    data.personEntries.push({ id: uid(), personId: editingPersonId, type: currentEntryType, amount, description, date });
+    $("entry-amount-input").value = "";
+    $("entry-description-input").value = "";
+    errorEl.classList.add("hidden");
+    persist();
+    renderPersonBalanceBanner(editingPersonId);
+    renderPersonEntries(editingPersonId);
+  }
+
+  function deleteEntry(entryId) {
+    data.personEntries = data.personEntries.filter((e) => e.id !== entryId);
+    persist();
+    renderPersonBalanceBanner(editingPersonId);
+    renderPersonEntries(editingPersonId);
+  }
+
   /* ================= Settings modal ================= */
   function renderCurrencyOptions() {
     const wrap = $("currency-options");
@@ -694,12 +1040,53 @@
     persist();
   }
 
+  function renderThemeOptions() {
+    const wrap = $("theme-options");
+    const theme = data.settings.theme || "light";
+    wrap.innerHTML = `
+      <button type="button" class="pill-btn${theme === "light" ? " active" : ""}" data-theme="light">Light</button>
+      <button type="button" class="pill-btn${theme === "dark" ? " active" : ""}" data-theme="dark">Dark</button>
+    `;
+  }
+
+  function setTheme(theme) {
+    data.settings.theme = theme;
+    applyTheme(theme);
+    renderThemeOptions();
+    persist();
+    renderCategoryChart();
+    renderTrendChart();
+  }
+
+  function renderAccentSwatches() {
+    const wrap = $("accent-swatches");
+    const accent = data.settings.accent || "#3B5BA5";
+    wrap.innerHTML = ACCENT_PRESETS.map((sw) => `
+      <button type="button" class="color-swatch${sw.toLowerCase() === accent.toLowerCase() ? " selected" : ""}" style="background:${sw}" data-accent="${sw}"></button>
+    `).join("");
+    $("accent-color-input").value = accent;
+  }
+
+  function setAccent(hex) {
+    data.settings.accent = hex;
+    applyAccent(hex);
+    renderAccentSwatches();
+    persist();
+  }
+
+  /* ================= Attachment lightbox ================= */
+  function openLightbox(src) {
+    $("lightbox-image").src = src;
+    openModal("attachment-lightbox");
+  }
+
   /* ================= Export ================= */
   function exportCSV() {
-    const rows = [["Date", "Type", "Category", "Description", "Amount", "Recurring"]];
+    const rows = [["Date", "Type", "Category", "Description", "Amount", "Tags", "Recurring"]];
     getFilteredTransactions().forEach((t) => {
       const cat = categoryById(t.category);
-      rows.push([t.date, t.type, cat ? cat.name : "Other", (t.description || "").replace(/"/g, '""'), t.amount, t.recurring ? "yes" : "no"]);
+      const recurLabel = t.recurring ? (t.frequency || "monthly") : "no";
+      rows.push([t.date, t.type, cat ? cat.name : "Other", (t.description || "").replace(/"/g, '""'), t.amount, (t.tags || []).join(";"), recurLabel]);
     });
     const csv = rows.map((r) => r.map((c) => '"' + c + '"').join(",")).join("\n");
     const blob = new Blob([csv], { type: "text/csv" });
@@ -834,7 +1221,12 @@
     $("add-transaction-btn").addEventListener("click", () => openTransactionModal(null));
     $("export-btn").addEventListener("click", exportCSV);
     $("export-pdf-btn").addEventListener("click", exportPDF);
-    $("settings-btn").addEventListener("click", () => { renderCurrencyOptions(); openModal("settings-modal"); });
+    $("settings-btn").addEventListener("click", () => {
+      renderCurrencyOptions();
+      renderThemeOptions();
+      renderAccentSwatches();
+      openModal("settings-modal");
+    });
     $("apply-recurring-btn").addEventListener("click", applyRecurring);
 
     $("search-input").addEventListener("input", (e) => { filters.search = e.target.value; renderTransactionList(); });
@@ -843,6 +1235,11 @@
     $("sort-select").addEventListener("change", (e) => { filters.sort = e.target.value; renderTransactionList(); });
 
     $("transaction-list").addEventListener("click", (e) => {
+      const thumb = e.target.closest("[data-action='view-attachment']");
+      if (thumb) {
+        openLightbox(thumb.getAttribute("src"));
+        return;
+      }
       const btn = e.target.closest("[data-action]");
       if (!btn) return;
       const id = btn.getAttribute("data-id");
@@ -857,6 +1254,16 @@
     $("type-expense-btn").addEventListener("click", () => setTxType("expense"));
     $("type-income-btn").addEventListener("click", () => setTxType("income"));
     $("save-transaction-btn").addEventListener("click", saveTransactionFromForm);
+    $("recurring-checkbox").addEventListener("change", (e) => setRecurringFieldVisibility(e.target.checked));
+    $("attachment-input").addEventListener("change", (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      compressImage(file, setAttachmentPreview);
+    });
+    $("remove-attachment-btn").addEventListener("click", () => {
+      $("attachment-input").value = "";
+      setAttachmentPreview(null);
+    });
     $("manage-categories-btn").addEventListener("click", () => {
       closeModal("transaction-modal");
       showCategoryListView();
@@ -897,6 +1304,51 @@
       setCurrency(btn.getAttribute("data-currency"));
     });
 
+    $("theme-options").addEventListener("click", (e) => {
+      const btn = e.target.closest(".pill-btn");
+      if (!btn) return;
+      setTheme(btn.getAttribute("data-theme"));
+    });
+
+    $("accent-swatches").addEventListener("click", (e) => {
+      const btn = e.target.closest(".color-swatch");
+      if (!btn) return;
+      setAccent(btn.getAttribute("data-accent"));
+    });
+
+    $("accent-color-input").addEventListener("input", (e) => setAccent(e.target.value));
+
+    $("scope-alltime-btn").addEventListener("click", () => setSummaryScope("alltime"));
+    $("scope-month-btn").addEventListener("click", () => setSummaryScope("month"));
+
+    $("people-btn").addEventListener("click", () => { openModal("people-modal"); showPeopleListView(); });
+    $("new-person-btn").addEventListener("click", showPersonFormView);
+    $("cancel-person-btn").addEventListener("click", showPeopleListView);
+    $("save-person-btn").addEventListener("click", savePersonFromForm);
+
+    $("people-list").addEventListener("click", (e) => {
+      const row = e.target.closest(".person-row");
+      if (!row) return;
+      openPersonDetail(row.getAttribute("data-id"));
+    });
+
+    $("back-to-people-btn").addEventListener("click", showPeopleListView);
+    $("edit-person-name-btn").addEventListener("click", startRenamePerson);
+    $("save-person-name-btn").addEventListener("click", saveRenamePerson);
+    $("delete-person-btn").addEventListener("click", () => {
+      if (window.confirm("Delete this person and all their entries?")) deleteCurrentPerson();
+    });
+
+    $("entry-gave-btn").addEventListener("click", () => setEntryType("gave"));
+    $("entry-received-btn").addEventListener("click", () => setEntryType("received"));
+    $("add-entry-btn").addEventListener("click", addEntryFromForm);
+
+    $("person-entries-list").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-action='delete-entry']");
+      if (!btn) return;
+      deleteEntry(btn.getAttribute("data-id"));
+    });
+
     document.querySelectorAll(".modal-close").forEach((btn) => {
       btn.addEventListener("click", () => closeModal(btn.getAttribute("data-close")));
     });
@@ -915,7 +1367,10 @@
   /* ================= Init ================= */
   function init() {
     loadData();
+    applyTheme(data.settings.theme || "light");
+    applyAccent(data.settings.accent || "#3B5BA5");
     initEvents();
+    setSummaryScope(summaryScope);
     renderAll();
   }
 
